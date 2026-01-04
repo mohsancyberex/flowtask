@@ -259,8 +259,6 @@ class _EnergyRadio extends StatelessWidget {
     return RadioListTile<TaskEnergy>(
       title: Text(title),
       value: value,
-      groupValue: groupValue,
-      onChanged: onChanged,
       contentPadding: const EdgeInsets.symmetric(horizontal: 16),
       activeColor: Theme.of(context).colorScheme.primary,
     );

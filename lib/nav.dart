@@ -3,11 +3,16 @@ import 'package:go_router/go_router.dart';
 import 'screens/main_screen.dart';
 import 'screens/add_task_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/splash_screen.dart';
 
 class AppRouter {
   static final router = GoRouter(
-    initialLocation: '/',
+    initialLocation: '/splash',
     routes: [
+      GoRoute(
+        path: '/splash',
+        builder: (context, state) => const SplashScreen(),
+      ),
       GoRoute(
         path: '/',
         builder: (context, state) => const MainScreen(),

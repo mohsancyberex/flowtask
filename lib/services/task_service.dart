@@ -1,447 +1,593 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
 import '../models/task.dart';
 
-class TaskService extends ChangeNotifier {
+class TaskService with ChangeNotifier {
   List<Task> _tasks = [];
   Task? _currentTask;
-  bool _isLoading = true;
-  TaskEnergy _userEnergy = TaskEnergy.medium; // Default user energy
+  TaskEnergy _userEnergy = TaskEnergy.medium;
+  bool _isLoading = false;
+  List<String> _completedToday = [];
+  bool _showMotivationalQuote = true;
+  bool _sponsorEnabled = false;
+  DateTime? _silentUntil;
+  Timer? _globalTimer;
   
-  // Behavioral state (private, persisted via SharedPreferences)
-  DateTime? _silentUntil; // Professional Silence Mode
-  DateTime? _lastInteractionAt;
-  String? _lastShownTaskId;
-  double _trust = 0.5; // 0..1
-  int _consecutiveActionDays = 0; // silent streaks, hidden
-  bool _sponsorEnabled = false; // user-chosen ad flag
-  int _rapidAddsInWindow = 0;
-  DateTime? _rapidWindowStart;
-  String? _lastInterventionTaskId;
+  // Pomodoro State
+  int _pomodoroSeconds = 25 * 60;
+  bool _isPomodoroRunning = false;
+  bool _isPomodoroWorkMode = true;
+
+  int get pomodoroSeconds => _pomodoroSeconds;
+  bool get isPomodoroRunning => _isPomodoroRunning;
+  bool get isPomodoroWorkMode => _isPomodoroWorkMode;
   
-  // Derived user state (not persisted)
-  final Random _rng = Random();
-  int _consecutiveSkips = 0;
-  bool _justCompletedMeaningful = false; // used to trigger sponsor prompt
-  
-  // Getters
   List<Task> get tasks => _tasks;
   Task? get currentTask => _currentTask;
-  bool get isLoading => _isLoading;
   TaskEnergy get userEnergy => _userEnergy;
+  bool get isLoading => _isLoading;
+  bool get showMotivationalQuote => _showMotivationalQuote;
   bool get sponsorEnabled => _sponsorEnabled;
   DateTime? get silentUntil => _silentUntil;
   
-  int get activeTaskCount => _tasks.where((t) => t.state != TaskState.completed).length;
-
-  TaskService() {
+  int get activeTaskCount => _tasks.where((t) => t.state == TaskState.pending).length;
+  int get completedToday => _completedToday.length;
+  int get highPriorityCount => _tasks.where((t) => t.priority == TaskPriority.high && t.state != TaskState.completed).length;
+  
+  final SharedPreferences _prefs;
+  
+  TaskService(this._prefs) {
     _loadTasks();
+    _loadSettings();
+    _startGlobalTimer();
+  }
+  
+  void _startGlobalTimer() {
+    _globalTimer?.cancel();
+    _globalTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      bool changed = false;
+      
+      // Pomodoro Logic
+      if (_isPomodoroRunning && _pomodoroSeconds > 0) {
+        _pomodoroSeconds--;
+        changed = true;
+        if (_pomodoroSeconds == 0) {
+          _isPomodoroRunning = false;
+          _handlePomodoroEnd();
+        }
+      }
+
+      // Task Timer Logic
+      for (int i = 0; i < _tasks.length; i++) {
+        if (_tasks[i].isTimerRunning && _tasks[i].lastTimerStart != null) {
+          final now = DateTime.now();
+          final diff = now.difference(_tasks[i].lastTimerStart!).inSeconds;
+          if (diff > 0) {
+            _tasks[i] = _tasks[i].copyWith(
+              durationSeconds: _tasks[i].durationSeconds + diff,
+              lastTimerStart: now,
+            );
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        notifyListeners();
+      }
+    });
   }
 
+  void _handlePomodoroEnd() {
+    // Toggle mode and reset time
+    _isPomodoroWorkMode = !_isPomodoroWorkMode;
+    _pomodoroSeconds = (_isPomodoroWorkMode ? 25 : 5) * 60;
+    notifyListeners();
+  }
+
+  void startPomodoro() {
+    _isPomodoroRunning = true;
+    notifyListeners();
+  }
+
+  void pausePomodoro() {
+    _isPomodoroRunning = false;
+    notifyListeners();
+  }
+
+  void resetPomodoro() {
+    _isPomodoroRunning = false;
+    _pomodoroSeconds = (_isPomodoroWorkMode ? 25 : 5) * 60;
+    notifyListeners();
+  }
+
+  void togglePomodoroMode() {
+    _isPomodoroWorkMode = !_isPomodoroWorkMode;
+    resetPomodoro();
+  }
+
+  @override
+  void dispose() {
+    _globalTimer?.cancel();
+    super.dispose();
+  }
+  
   Future<void> _loadTasks() async {
+    _isLoading = true;
+    notifyListeners();
+    
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final String? tasksJson = prefs.getString('flowtask_tasks');
-      if (tasksJson != null) {
-        final List<dynamic> decoded = json.decode(tasksJson);
-        _tasks = decoded.map((item) => Task.fromMap(item)).toList();
-      }
+      final tasksJson = _prefs.getStringList('tasks') ?? [];
+      _tasks = tasksJson.map((json) {
+        try {
+          final map = jsonDecode(json);
+          return Task.fromMap(map);
+        } catch (e) {
+          return Task(
+            id: DateTime.now().microsecondsSinceEpoch.toString(),
+            text: 'Sample task',
+            createdAt: DateTime.now(),
+          );
+        }
+      }).toList();
       
-      // Load user energy preference if saved, or default
-      final int? energyIndex = prefs.getInt('flowtask_user_energy');
-      if (energyIndex != null) {
-        _userEnergy = TaskEnergy.values[energyIndex];
-      }
-
-      // Behavioral persistence
-      final String? silentUntilIso = prefs.getString('flowtask_silent_until');
-      if (silentUntilIso != null) _silentUntil = DateTime.tryParse(silentUntilIso);
-      final String? lastInteractionIso = prefs.getString('flowtask_last_interaction');
-      if (lastInteractionIso != null) _lastInteractionAt = DateTime.tryParse(lastInteractionIso);
-      _lastShownTaskId = prefs.getString('flowtask_last_shown_id');
-      _trust = prefs.getDouble('flowtask_trust') ?? 0.5;
-      _consecutiveActionDays = prefs.getInt('flowtask_streak_hidden') ?? 0;
-      _sponsorEnabled = prefs.getBool('flowtask_sponsor_enabled') ?? false;
-
-      _refreshCurrentTask();
+      _currentTask = _getNextTask();
     } catch (e) {
-      debugPrint('Error loading tasks: $e');
+      if (kDebugMode) {
+        print('Error loading tasks: $e');
+      }
     } finally {
       _isLoading = false;
       notifyListeners();
     }
   }
-
+  
   Future<void> _saveTasks() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final String encoded = json.encode(_tasks.map((t) => t.toMap()).toList());
-      await prefs.setString('flowtask_tasks', encoded);
-      await prefs.setInt('flowtask_user_energy', _userEnergy.index);
-      await prefs.setString('flowtask_last_interaction', (_lastInteractionAt ?? DateTime.now()).toIso8601String());
-      if (_silentUntil != null) {
-        await prefs.setString('flowtask_silent_until', _silentUntil!.toIso8601String());
-      } else {
-        await prefs.remove('flowtask_silent_until');
-      }
-      if (_lastShownTaskId != null) await prefs.setString('flowtask_last_shown_id', _lastShownTaskId!);
-      await prefs.setDouble('flowtask_trust', _trust);
-      await prefs.setInt('flowtask_streak_hidden', _consecutiveActionDays);
-      await prefs.setBool('flowtask_sponsor_enabled', _sponsorEnabled);
+      final tasksJson = _tasks.map((task) => jsonEncode(task.toMap())).toList();
+      await _prefs.setStringList('tasks', tasksJson);
     } catch (e) {
-      debugPrint('Error saving tasks: $e');
+      if (kDebugMode) {
+        print('Error saving tasks: $e');
+      }
+    }
+  }
+  
+  Future<void> _loadSettings() async {
+    final energyIndex = _prefs.getInt('userEnergy') ?? 1;
+    _userEnergy = TaskEnergy.values[energyIndex];
+    _showMotivationalQuote = _prefs.getBool('showMotivationalQuote') ?? true;
+    _sponsorEnabled = _prefs.getBool('sponsorEnabled') ?? false;
+    final silentUntilStr = _prefs.getString('silentUntil');
+    if (silentUntilStr != null) {
+      _silentUntil = DateTime.tryParse(silentUntilStr);
+    }
+  }
+  
+  Task? _getNextTask() {
+    if (_tasks.isEmpty) return null;
+    
+    var filteredTasks = _tasks.where((task) {
+      if (task.state == TaskState.completed) return false;
+      if (task.hiddenUntil != null && DateTime.now().isBefore(task.hiddenUntil!)) return false;
+      return true;
+    }).toList();
+    
+    if (filteredTasks.isEmpty) return null;
+    
+    filteredTasks.sort((a, b) {
+      final aEnergyMatch = a.energy == _userEnergy ? 2 : (a.energy?.index == _userEnergy.index ? 1 : 0);
+      final bEnergyMatch = b.energy == _userEnergy ? 2 : (b.energy?.index == _userEnergy.index ? 1 : 0);
+      
+      if (aEnergyMatch != bEnergyMatch) {
+        return bEnergyMatch.compareTo(aEnergyMatch);
+      }
+      
+      if (a.priority != b.priority) {
+        final priorityOrder = {TaskPriority.high: 3, TaskPriority.medium: 2, TaskPriority.low: 1, TaskPriority.none: 0};
+        return priorityOrder[b.priority]!.compareTo(priorityOrder[a.priority]!);
+      }
+      
+      return a.createdAt.compareTo(b.createdAt);
+    });
+    
+    return filteredTasks.first;
+  }
+  
+  Future<void> addTask(
+    String text, {
+    TaskEnergy energy = TaskEnergy.medium,
+    TaskPriority priority = TaskPriority.none,
+    DateTime? dueDate,
+    int? estimatedMinutes,
+    List<String>? tags,
+    String? project,
+    DateTime? hiddenUntil,
+    List<String>? context, // Mapped to tags for now
+    bool isRecurring = false,
+    String? recurrencePattern,
+    List<String>? initialSubtasks,
+  }) async {
+    // Merge context into tags if provided
+    final finalTags = [...?tags, ...?context];
+    
+    final task = Task(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      text: text,
+      createdAt: DateTime.now(),
+      energy: energy,
+      priority: priority,
+      dueDate: dueDate,
+      estimatedMinutes: estimatedMinutes,
+      tags: finalTags.isNotEmpty ? finalTags : null,
+      project: project,
+      hiddenUntil: hiddenUntil,
+      isRecurring: isRecurring,
+      recurrencePattern: recurrencePattern,
+      subtasks: initialSubtasks?.map((s) => Subtask(
+        id: DateTime.now().microsecondsSinceEpoch.toString() + s.hashCode.toString(),
+        text: s,
+      )).toList() ?? [],
+    );
+    
+    _tasks.add(task);
+    await _saveTasks();
+    
+    if (_currentTask == null) {
+      _currentTask = task;
+    }
+    
+    notifyListeners();
+  }
+  
+  // REMOVED: Old completeTask() method without parameters
+  
+  // REMOVED: Old snoozeTask() method without parameters
+  
+  // REMOVED: Old skipTask() method without parameters
+  
+  // NEW: Complete a specific task
+  Future<void> completeTask(Task task) async {
+    final index = _tasks.indexWhere((t) => t.id == task.id);
+    if (index == -1) return;
+    
+    var updatedTask = _tasks[index].copyWith(
+      state: TaskState.completed,
+      isTimerRunning: false,
+      completedAt: DateTime.now(), // Store completion time for stats
+    );
+    _tasks[index] = updatedTask;
+    
+    // Handle Recurrence
+    if (updatedTask.isRecurring) {
+      _handleRecurrence(updatedTask);
+    }
+    
+    final today = DateTime.now().toIso8601String().split('T')[0];
+    _completedToday.add(task.id);
+    await _prefs.setStringList('completed_$today', _completedToday);
+    
+    await _saveTasks();
+    
+    // Update current task if the completed one was current
+    if (_currentTask?.id == task.id) {
+      _currentTask = _getNextTask();
+    }
+    
+    notifyListeners();
+  }
+
+  void _handleRecurrence(Task task) {
+    if (task.recurrencePattern == null) return;
+
+    DateTime? nextDate;
+    final now = task.dueDate ?? DateTime.now();
+
+    switch (task.recurrencePattern) {
+      case 'daily':
+        nextDate = now.add(const Duration(days: 1));
+        break;
+      case 'weekly':
+        nextDate = now.add(const Duration(days: 7));
+        break;
+      case 'monthly':
+        nextDate = DateTime(now.year, now.month + 1, now.day);
+        break;
+    }
+
+    if (nextDate != null) {
+      final newTask = Task(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        text: task.text,
+        createdAt: DateTime.now(),
+        dueDate: nextDate,
+        priority: task.priority,
+        energy: task.energy,
+        project: task.project,
+        tags: task.tags,
+        isRecurring: true,
+        recurrencePattern: task.recurrencePattern,
+        subtasks: task.subtasks.map((s) => Subtask(id: '${DateTime.now().microsecondsSinceEpoch}_${s.id}', text: s.text)).toList(),
+      );
+      _tasks.add(newTask);
     }
   }
 
+  Future<void> startTaskTimer(String taskId) async {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index == -1) return;
+
+    // Stop other running timers? Usually only one task at a time.
+    for (int i = 0; i < _tasks.length; i++) {
+      if (_tasks[i].isTimerRunning) {
+        _tasks[i] = _tasks[i].copyWith(isTimerRunning: false, lastTimerStart: null);
+      }
+    }
+
+    _tasks[index] = _tasks[index].copyWith(
+      isTimerRunning: true,
+      lastTimerStart: DateTime.now(),
+    );
+    notifyListeners();
+    await _saveTasks();
+  }
+
+  Future<void> stopTaskTimer(String taskId) async {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index == -1) return;
+
+    _tasks[index] = _tasks[index].copyWith(
+      isTimerRunning: false,
+      lastTimerStart: null,
+    );
+    notifyListeners();
+    await _saveTasks();
+  }
+
+  Future<void> addSubtask(String taskId, String text) async {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index == -1) return;
+
+    final subtask = Subtask(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      text: text,
+    );
+
+    final updatedSubtasks = List<Subtask>.from(_tasks[index].subtasks)..add(subtask);
+    _tasks[index] = _tasks[index].copyWith(subtasks: updatedSubtasks);
+    
+    notifyListeners();
+    await _saveTasks();
+  }
+
+  Future<void> toggleSubtask(String taskId, String subtaskId) async {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index == -1) return;
+
+    final subtaskIndex = _tasks[index].subtasks.indexWhere((s) => s.id == subtaskId);
+    if (subtaskIndex == -1) return;
+
+    final subtasks = List<Subtask>.from(_tasks[index].subtasks);
+    subtasks[subtaskIndex] = Subtask(
+      id: subtasks[subtaskIndex].id,
+      text: subtasks[subtaskIndex].text,
+      isDone: !subtasks[subtaskIndex].isDone,
+    );
+
+    _tasks[index] = _tasks[index].copyWith(subtasks: subtasks);
+    
+    notifyListeners();
+    await _saveTasks();
+  }
+  
+  // NEW: Complete the current task (for backward compatibility)
+  Future<void> completeCurrentTask() async {
+    if (_currentTask == null) return;
+    await completeTask(_currentTask!);
+  }
+  
+  // NEW: Snooze a specific task
+  Future<void> snoozeTask(Task task, {DateTime? until}) async {
+    final index = _tasks.indexWhere((t) => t.id == task.id);
+    if (index == -1) return;
+    
+    var updatedTask = _tasks[index];
+    final snoozeUntil = until ?? DateTime.now().add(const Duration(hours: 2));
+    
+    updatedTask = updatedTask.copyWith(
+      state: TaskState.snoozed,
+      hiddenUntil: snoozeUntil,
+      lastShown: DateTime.now(),
+      avoidanceCount: updatedTask.avoidanceCount + 1,
+      isTimerRunning: false,
+    );
+    _tasks[index] = updatedTask;
+    
+    await _saveTasks();
+    
+    // Update current task if the snoozed one was current
+    if (_currentTask?.id == task.id) {
+      _currentTask = _getNextTask();
+    }
+    
+    notifyListeners();
+  }
+  
+  // NEW: Skip a specific task
+  Future<void> skipTask(Task task) async {
+    final index = _tasks.indexWhere((t) => t.id == task.id);
+    if (index == -1) return;
+    
+    var updatedTask = _tasks[index].copyWith(
+      avoidanceCount: task.avoidanceCount + 1,
+      lastShown: DateTime.now(),
+    );
+    _tasks[index] = updatedTask;
+    
+    await _saveTasks();
+    
+    // Update current task if the skipped one was current
+    if (_currentTask?.id == task.id) {
+      _currentTask = _getNextTask();
+    }
+    
+    notifyListeners();
+  }
+  
+  Future<void> updateTaskText(String taskId, String newText) async {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index == -1) return;
+    
+    final task = _tasks[index];
+    _tasks[index] = task.copyWith(text: newText);
+    
+    await _saveTasks();
+    notifyListeners();
+  }
+  
+  Future<void> deleteTask(String taskId) async {
+    _tasks.removeWhere((t) => t.id == taskId);
+    await _saveTasks();
+    
+    if (_currentTask?.id == taskId) {
+      _currentTask = _getNextTask();
+    }
+    notifyListeners();
+  }
+  
+  Future<void> hideTask(String taskId, Duration duration) async {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index == -1) return;
+    
+    final task = _tasks[index];
+    final hiddenUntil = DateTime.now().add(duration);
+    
+    _tasks[index] = task.copyWith(
+      hiddenUntil: hiddenUntil,
+      interventionShownAt: DateTime.now(),
+    );
+    
+    await _saveTasks();
+    if (_currentTask?.id == taskId) {
+      _currentTask = _getNextTask();
+    }
+    notifyListeners();
+  }
+  
   void setUserEnergy(TaskEnergy energy) {
     _userEnergy = energy;
-    _saveTasks();
-    _refreshCurrentTask();
+    _prefs.setInt('userEnergy', energy.index);
+    _currentTask = _getNextTask();
+    notifyListeners();
+  }
+  
+  void completeRecoveryNudge() {
+    notifyListeners();
+  }
+  
+  void toggleMotivationalQuote(bool show) {
+    _showMotivationalQuote = show;
+    _prefs.setBool('showMotivationalQuote', show);
+    notifyListeners();
+  }
+  
+  String getDailyQuote() {
+    final quotes = [
+      "The secret of getting ahead is getting started.",
+      "Don't watch the clock; do what it does. Keep going.",
+      "The only way to do great work is to love what you do.",
+      "It always seems impossible until it's done.",
+      "Your future is created by what you do today, not tomorrow.",
+    ];
+    
+    final random = Random();
+    return quotes[random.nextInt(quotes.length)];
+  }
+  
+  // REMOVE or comment out this method for production
+  void addSampleTasks() {
+    // Comment out for production
+    /*
+    addTask('Review project proposal', energy: TaskEnergy.high, priority: TaskPriority.high);
+    addTask('Email team about meeting', energy: TaskEnergy.medium, priority: TaskPriority.medium);
+    addTask('Organize desk', energy: TaskEnergy.low, priority: TaskPriority.low, tags: ['home']);
+    addTask('Plan next week', priority: TaskPriority.medium, estimatedMinutes: 30);
+    addTask('Learn new Flutter feature', energy: TaskEnergy.high, tags: ['learning', 'work']);
+    notifyListeners();
+    */
+  }
+  
+  Future<void> clearCompleted() async {
+    _tasks.removeWhere((t) => t.state == TaskState.completed);
+    await _saveTasks();
+    _currentTask = _getNextTask();
     notifyListeners();
   }
 
   void setSponsorEnabled(bool enabled) {
     _sponsorEnabled = enabled;
-    _saveTasks();
+    _prefs.setBool('sponsorEnabled', enabled);
     notifyListeners();
   }
 
-  // Smart Logic to pick the ONE task
-  void _refreshCurrentTask() {
-    // If in Professional Silence Mode, keep UI calm (still allow core flow)
-    final bool isSilent = _silentUntil != null && DateTime.now().isBefore(_silentUntil!);
-
-    // 1) Filter eligible tasks
-    final now = DateTime.now();
-    final List<Task> pool = _tasks.where((t) => t.state != TaskState.completed).toList();
-    if (pool.isEmpty) {
-      _currentTask = null;
-      return;
-    }
-
-    // Remove tasks by eligibility
-    final List<Task> eligible = pool.where((t) {
-      // Energy mismatch removal (hard filter): only allow when equal or task.energy lower than user energy
-      final energyMismatch = _energyMismatch(t.energy, _userEnergy) > 0;
-      final bool energyAllowed = !energyMismatch || t.energy == TaskEnergy.low; // low tasks ok anytime
-
-      // Last shown too recent (cooldown 45 minutes)
-      // Allow brand-new tasks (never shown) to surface immediately
-      final bool notTooRecent = (t.shownCount == 0) || now.difference(t.lastShown).inMinutes > 45;
-
-      // Hidden window (e.g., snoozed via intervention)
-      final bool notHidden = t.hiddenUntil == null || now.isAfter(t.hiddenUntil!);
-
-      // Repeated resistance (3+ skips) are removed unless user has high energy and not silent
-      final bool notResisted = t.skips < 3 || (_userEnergy == TaskEnergy.high && !isSilent);
-
-      // Never show the same task twice in a row
-      final bool notSameAsLast = t.id != _lastShownTaskId;
-
-      return energyAllowed && notTooRecent && notHidden && notResisted && notSameAsLast;
-    }).toList();
-
-    if (eligible.isEmpty) {
-      _currentTask = null; // Nothing Mode
-      return;
-    }
-
-    // 2) Score by friction (lower is easier)
-    final scored = eligible
-        .map((t) => MapEntry(t, _friction(t)))
-        .toList()
-      ..sort((a, b) => a.value.compareTo(b.value));
-
-    // Occasionally surface medium friction to avoid stagnation (20% chance)
-    Task selected = scored.first.key;
-    if (scored.length > 2) {
-      final mediumIndex = min(2, scored.length - 1);
-      final double bestF = scored.first.value;
-      final double medF = scored[mediumIndex].value;
-      final bool hasMedium = medF < (bestF + 0.5) && medF > (bestF + 0.15);
-      if (hasMedium && _rng.nextDouble() < 0.2) {
-        selected = scored[mediumIndex].key;
-      }
-    }
-
-    // If all high friction (>1.2) show Nothing Mode
-    if (scored.isNotEmpty && scored.first.value > 1.2) {
-      _currentTask = null;
-      return;
-    }
-
-    // Promote selected to 'now' and increment shown
-    _promoteToNow(selected);
-  }
-
-  // Friction score per spec (lower is easier)
-  double _friction(Task t) {
-    final ageDays = max(0, DateTime.now().difference(t.createdAt).inDays);
-    final energyMismatch = _energyMismatch(t.energy, _userEnergy);
-    final base = (t.skips * 0.4) + (ageDays * 0.2) + (t.shownCount * 0.2) + (energyMismatch * 0.5) + (t.emotionalResistance * 0.6);
-    // Task gravity reduces friction (floats up)
-    final gravityBonus = max(0, 0.3 * t.gravity);
-    // Small trust-based easing on good streaks
-    final trustEasing = (_trust - 0.5) * 0.2;
-    return max(0, base - gravityBonus - trustEasing);
-  }
-
-  int _energyMismatch(TaskEnergy taskEnergy, TaskEnergy userEnergy) {
-    if (taskEnergy == userEnergy) return 0;
-    if (taskEnergy == TaskEnergy.low && userEnergy == TaskEnergy.high) return 0; // ok
-    if (taskEnergy == TaskEnergy.medium && userEnergy == TaskEnergy.high) return 0; // ok
-    return 1;
-  }
-
-  void _promoteToNow(Task task) {
-    final index = _tasks.indexWhere((t) => t.id == task.id);
-    if (index != -1) {
-      final updated = _tasks[index].copyWith(
-        state: TaskState.now,
-        shownCount: _tasks[index].shownCount + 1,
-        lastShown: DateTime.now(),
-      );
-      _tasks[index] = updated;
-      _currentTask = updated;
-      _lastShownTaskId = updated.id;
-      _saveTasks();
-    } else {
-      _currentTask = task; // fallback
-    }
-  }
-
-  // Actions
-
-  Future<void> addTask(String text, {List<String> context = const [], TaskEnergy energy = TaskEnergy.medium, DateTime? hiddenUntil}) async {
-    if (activeTaskCount >= 7) {
-       debugPrint('Decision fatigue protection: max 7 active tasks.');
-       return;
-    }
-
-    // Decision fatigue: rate-limit rapid adds
-    final now = DateTime.now();
-    if (_rapidWindowStart == null || now.difference(_rapidWindowStart!).inSeconds > 60) {
-      _rapidWindowStart = now;
-      _rapidAddsInWindow = 0;
-    }
-    _rapidAddsInWindow++;
-
-    final newTask = Task(
-      id: const Uuid().v4(),
-      text: text,
-      createdAt: DateTime.now(),
-      lastShown: DateTime.now(),
-      context: context,
-      energy: energy,
-      state: TaskState.next, // Start in queue
-      hiddenUntil: hiddenUntil,
-    );
-
-    _tasks.add(newTask);
-    _saveTasks();
-    // Always refresh selection so new task can surface immediately
-    _refreshCurrentTask();
-    notifyListeners();
-  }
-
-  Future<void> completeTask() async {
-    if (_currentTask == null) return;
-    
-    // Mark as completed
-    final id = _currentTask!.id;
-    final idx = _tasks.indexWhere((t) => t.id == id);
-    if (idx != -1) {
-      // Learning: completing reduces emotional resistance, increases gravity, may mark safe win
-      final t = _tasks[idx];
-      final timeSinceShown = DateTime.now().difference(t.lastShown).inMinutes;
-      final double easeDelta = timeSinceShown <= 10 ? 0.15 : 0.08;
-      final bool safe = timeSinceShown <= 10 && _friction(t) < 0.8;
-      final updated = t.copyWith(
-        state: TaskState.completed,
-        completeCount: t.completeCount + 1,
-        emotionalResistance: (t.emotionalResistance - easeDelta).clamp(0.0, 1.0),
-        gravity: (t.gravity + 0.1).clamp(0.0, 1.0),
-        safeWin: t.safeWin || safe,
-      );
-      _tasks[idx] = updated;
-    }
-    _justCompletedMeaningful = true;
-    _consecutiveSkips = 0; // reset
-    _bumpTrust(0.03);
-    _touchInteraction();
-    
-    // Find next
-    _refreshCurrentTask();
-    notifyListeners();
-  }
-
-  Future<void> skipTask() async {
-    if (_currentTask == null) return;
-
-    final task = _currentTask!;
-    final newSkips = task.skips + 1;
-    
-    // Update task
-    final index = _tasks.indexWhere((t) => t.id == task.id);
-    if (index != -1) {
-      _tasks[index] = task.copyWith(
-        skips: newSkips,
-        state: TaskState.later, // Move to back of line
-        lastShown: DateTime.now(),
-        emotionalResistance: (task.emotionalResistance + 0.08).clamp(0.0, 1.0),
-        gravity: (task.gravity - 0.05).clamp(0.0, 1.0),
-      );
-    }
-    
-    _saveTasks();
-    _consecutiveSkips++;
-    if (_consecutiveSkips >= 5) {
-      _enterSilence();
-    }
-    _bumpTrust(-0.02);
-    _touchInteraction();
-    _refreshCurrentTask();
-    notifyListeners();
-  }
-
-  Future<void> snoozeTask() async {
-    // Like skip but explicit "Later" intention
-    await skipTask(); 
-  }
-
-  void _updateTaskState(String id, TaskState newState) {
-    final index = _tasks.indexWhere((t) => t.id == id);
-    if (index != -1) {
-      _tasks[index] = _tasks[index].copyWith(state: newState);
-      _saveTasks();
-    }
-  }
-
-  Future<void> completeTaskById(String id) async {
-    final idx = _tasks.indexWhere((t) => t.id == id);
-    if (idx == -1) return;
-    final t = _tasks[idx];
-    final updated = t.copyWith(
-      state: TaskState.completed,
-      completeCount: t.completeCount + 1,
-      emotionalResistance: (t.emotionalResistance - 0.08).clamp(0.0, 1.0),
-      gravity: (t.gravity + 0.1).clamp(0.0, 1.0),
-      lastShown: DateTime.now(),
-    );
-    _tasks[idx] = updated;
-    _justCompletedMeaningful = true;
-    _consecutiveSkips = 0;
-    _bumpTrust(0.02);
-    _touchInteraction();
-    await _saveTasks();
-    _refreshCurrentTask();
-    notifyListeners();
-  }
-
-  Future<void> snoozeTaskById(String id) async {
-    final idx = _tasks.indexWhere((t) => t.id == id);
-    if (idx == -1) return;
-    final t = _tasks[idx];
-    _tasks[idx] = t.copyWith(
-      state: TaskState.later,
-      lastShown: DateTime.now(),
-      emotionalResistance: (t.emotionalResistance + 0.05).clamp(0.0, 1.0),
-      gravity: (t.gravity - 0.03).clamp(0.0, 1.0),
-    );
-    await _saveTasks();
-    _refreshCurrentTask();
-    notifyListeners();
-  }
-  
-  Future<void> hideTask(String id, Duration duration) async {
-    final idx = _tasks.indexWhere((t) => t.id == id);
-    if (idx != -1) {
-      _tasks[idx] = _tasks[idx].copyWith(
-        state: TaskState.later,
-        hiddenUntil: DateTime.now().add(duration),
-      );
-      await _saveTasks();
-      _refreshCurrentTask();
-      notifyListeners();
-    }
-  }
-
-  Future<void> deleteTask(String id) async {
-    _tasks.removeWhere((t) => t.id == id);
-    await _saveTasks();
-    _refreshCurrentTask();
-    notifyListeners();
-  }
-
-  Future<void> updateTaskText(String id, String newText) async {
-    final idx = _tasks.indexWhere((t) => t.id == id);
-    if (idx != -1) {
-      _tasks[idx] = _tasks[idx].copyWith(text: newText);
-      await _saveTasks();
-      notifyListeners();
-    }
-  }
-  
-  void _enterSilence() {
-    _silentUntil = DateTime.now().add(const Duration(hours: 24));
-    debugPrint('Entering Professional Silence Mode until: $_silentUntil');
-    _saveTasks();
-  }
-
-  void _touchInteraction() {
-    _lastInteractionAt = DateTime.now();
-  }
-
-  void _bumpTrust(double delta) {
-    _trust = (_trust + delta).clamp(0.0, 1.0);
-  }
-  
-  bool get shouldShowSponsorCard {
-    if (!_sponsorEnabled) return false;
-    if (_silentUntil != null && DateTime.now().isBefore(_silentUntil!)) return false;
-    if (!_justCompletedMeaningful) return false;
-    // require recent low skip mood
-    final lowSkipMood = _consecutiveSkips == 0;
-    final confident = _trust > 0.55;
-    return lowSkipMood && confident;
-  }
-
-  void onSponsorShown() {
-    _justCompletedMeaningful = false;
-  }
-  
-  bool needsIntervention(Task t) {
-    final ageDays = DateTime.now().difference(t.createdAt).inDays;
-    final neverCompleted = t.completeCount == 0;
-    if (_lastInterventionTaskId == t.id) return false;
-    return t.skips >= 3 && ageDays >= 7 && neverCompleted;
-  }
-
-  void markInterventionShown(String id) {
-    _lastInterventionTaskId = id;
-  }
-
-  void completeRecoveryNudge() {
-    _bumpTrust(0.01);
-    _touchInteraction();
-    notifyListeners();
-  }
-  
-  // For debugging/reset
   Future<void> clearAll() async {
     _tasks.clear();
+    await _prefs.remove('tasks');
     _currentTask = null;
-    _silentUntil = null;
-    _lastInteractionAt = null;
-    _lastShownTaskId = null;
-    _trust = 0.5;
-    _consecutiveActionDays = 0;
-    _consecutiveSkips = 0;
-    _sponsorEnabled = false;
-    await _saveTasks();
     notifyListeners();
+  }
+
+  // ========== STATISTICS LOGIC ==========
+
+  Map<DateTime, int> getWeeklyStats() {
+    final stats = <DateTime, int>{};
+    final now = DateTime.now();
+    for (int i = 0; i < 7; i++) {
+      final date = DateTime(now.year, now.month, now.day).subtract(Duration(days: i));
+      stats[date] = 0;
+    }
+
+    for (final task in _tasks) {
+      if (task.state == TaskState.completed && task.completedAt != null) {
+        final date = DateTime(task.completedAt!.year, task.completedAt!.month, task.completedAt!.day);
+        if (stats.containsKey(date)) {
+          stats[date] = stats[date]! + 1;
+        }
+      }
+    }
+    return stats;
+  }
+
+  Map<String, int> getProjectStats() {
+    final stats = <String, int>{};
+    for (final task in _tasks) {
+      final projectName = task.project ?? 'Inbox';
+      stats[projectName] = (stats[projectName] ?? 0) + (task.state == TaskState.completed ? 1 : 0);
+    }
+    return stats;
+  }
+
+  Map<String, double> getProjectProgress() {
+    final projectTasks = <String, List<Task>>{};
+    for (final task in _tasks) {
+      final p = task.project ?? 'Inbox';
+      projectTasks[p] ??= [];
+      projectTasks[p]!.add(task);
+    }
+    
+    return projectTasks.map((name, tasks) {
+      final done = tasks.where((t) => t.state == TaskState.completed).length;
+      return MapEntry(name, done / tasks.length);
+    });
+  }
+
+  int getTotalSecondsThisWeek() {
+    int total = 0;
+    for (final task in _tasks) {
+      total += task.durationSeconds;
+    }
+    return total;
   }
 }

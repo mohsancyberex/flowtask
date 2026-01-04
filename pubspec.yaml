@@ -1,34 +1,26 @@
 name: flowtask
-description: "FlowTask is a revolutionary to-do app designed to reduce decision fatigue by showing you only one task at a time, intelligently adapting to your context and energy without any logins or cloud-based distractions."
-publish_to: "none"
-version: 1.0.0
+description:  task management app
+publish_to: 'none'
+version: 1.0.0+1
 
 environment:
-  sdk: ^3.6.0
+  sdk: '>=3.0.0 <4.0.0'
 
 dependencies:
-  animate_do: ^4.0.0
-  uuid: ^4.0.0
-  intl: 0.20.2
-  shared_preferences: ^2.0.0
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
-  google_fonts: ^6.1.0
-  provider: ^6.1.2
-  go_router: ^16.2.0
+  flutter_svg: ^2.0.10 
+  animate_do: ^3.1.2
+  provider: ^6.1.1
+  shared_preferences: ^2.2.2
+  intl: ^0.18.1
+  confetti: ^0.7.0
+  go_router: ^17.0.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^5.0.0
-  flutter_launcher_icons: ^0.13.1
+  flutter_lints: ^3.0.1
 
 flutter:
   uses-material-design: true
-
-flutter_launcher_icons:
-  android: true
-  ios: true
-  image_path: assets/icons/dreamflow_icon.jpg
-  remove_alpha_ios: true
